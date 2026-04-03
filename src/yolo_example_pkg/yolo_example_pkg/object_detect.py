@@ -84,9 +84,11 @@ class YoloDetectionNode(Node):
     def depth_callback_compressed(self, msg):
         """接收 **壓縮** 深度圖（當無壓縮深度圖不可用時使用）"""
         try:
-            self.latest_depth_image_compressed = self.bridge.compressed_imgmsg_to_cv2(
-                msg, desired_encoding="passthrough"
-            )
+            # 自行強制使用 cv2.IMREAD_UNCHANGED 解碼，避開 cv_bridge 的潛在雷區
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            depth_img = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+            if depth_img is not None:
+                self.latest_depth_image_compressed = depth_img
         except Exception as e:
             self.get_logger().error(f"Could not convert compressed depth image: {e}")
 
