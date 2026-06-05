@@ -10,6 +10,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 import torch
 
+using_yolo_det_model = False
+using_yolo_seg_model = True
 
 class YoloDetectionNode(Node):
     def __init__(self):
@@ -21,15 +23,30 @@ class YoloDetectionNode(Node):
         self.latest_depth_image_raw = None
         self.latest_depth_image_compressed = None
 
-        # 使用 yolo model 位置
-        model_path = os.path.join(
-            get_package_share_directory("yolo_example_pkg"), "models", "tennis_v2.pt"
-        )
+        # 使用 yolo detection model 位置
+        if using_yolo_det_model:
+            det_model_path = os.path.join(
+                get_package_share_directory("yolo_example_pkg"), "models", "detection.pt"
+            )
+        
+        # 使用 yolo segmentation model 位置
+        if using_yolo_seg_model:
+            seg_model_path = os.path.join(
+                get_package_share_directory("yolo_example_pkg"), "models", "segmentation.pt"
+            )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print("Using device : ", device)
-        self.model = YOLO(model_path)
-        self.model.to(device)
+
+        # 初始化 YOLO detection 模型
+        if using_yolo_det_model:
+            self.det_model = YOLO(det_model_path)
+            self.det_model.to(device)
+
+        # 初始化 YOLO segmentation 模型
+        if using_yolo_seg_model:
+            self.seg_model = YOLO(seg_model_path)
+            self.seg_model.to(device)
 
         # 訂閱影像 Topic
         self.image_sub = self.create_subscription(
@@ -50,9 +67,15 @@ class YoloDetectionNode(Node):
         )
 
         # 發佈處理後的影像 Topic
-        self.image_pub = self.create_publisher(
-            CompressedImage, "/yolo/detection/compressed", 10
-        )
+        if using_yolo_det_model:
+            self.det_image_pub = self.create_publisher(
+                CompressedImage, "/yolo/detection/compressed", 10
+            )
+
+        if using_yolo_seg_model:
+            self.seg_image_pub = self.create_publisher(
+                CompressedImage, "/yolo/segmentation/compressed", 10
+            )
 
         # 發布 目標檢測數據 (是否找到目標 + 距離)
         self.target_pub = self.create_publisher(
@@ -64,7 +87,7 @@ class YoloDetectionNode(Node):
         )
 
         # 設定要過濾標籤 (如果為空，那就不過濾)
-        self.allowed_labels = {"tennis"}
+        self.allowed_labels = {}
 
         # 設定 YOLO 可信度閾值
         self.conf_threshold = 0.5  # 可以修改這個值來調整可信度
@@ -103,21 +126,36 @@ class YoloDetectionNode(Node):
             self.get_logger().error(f"Could not convert image: {e}")
             return
 
-        # 使用 YOLO 模型檢測物體
-        try:
-            results = self.model(cv_image, conf=self.conf_threshold, verbose=False)
-        except Exception as e:
-            self.get_logger().error(f"Error during YOLO detection: {e}")
-            return
+        if using_yolo_det_model:
+            # 使用 YOLO Detection 模型檢測物體
+            try:
+                det_results = self.det_model(cv_image, conf=self.conf_threshold, verbose=False)
+            except Exception as e:
+                self.get_logger().error(f"Error during YOLO detection: {e}")
+                return
+            
+            # 繪製 Bounding Box
+            det_image = self.draw_bounding_boxes(cv_image, det_results)
+            
+            # 取得影像中心深度並發布
+            self.publish_x_multi_depths(det_image)
+            
+            # 發佈 Detection 影像
+            self.publish_det_image(det_image)
 
-        # 繪製 Bounding Box
-        processed_image = self.draw_bounding_boxes(cv_image, results)
+        if using_yolo_seg_model:
+            # 使用 YOLO Segmentation 模型檢測物體
+            try:
+                seg_results = self.seg_model(cv_image, conf=self.conf_threshold, verbose=False)
+            except Exception as e:
+                self.get_logger().error(f"Error during YOLO segmentation: {e}")
+                return
 
-        # 取得影像中心深度並發布
-        self.publish_x_multi_depths(processed_image)
-
-        # 發佈處理後的影像
-        self.publish_image(processed_image)
+            # 繪製 Mask
+            seg_image = self.draw_masks(cv_image, seg_results)
+            
+            # 發佈 Segmentation 影像
+            self.publish_seg_image(seg_image)
 
     def draw_cross(self, image):
         # 回傳繪製十字架的影像和畫面正中間的像素座標
@@ -162,17 +200,19 @@ class YoloDetectionNode(Node):
         found_target = 0
         target_distance = 0.0
         delta_x = 0.0
-        image, points = self.draw_cross(image)
+        det_image = image.copy()
+        tmp_image = image.copy()
+        tmp_image, points = self.draw_cross(tmp_image)
         for result in results:
             for box in result.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 conf = float(box.conf)
                 class_id = int(box.cls[0])
-                class_name = self.model.names[class_id]
+                class_name = self.det_model.names[class_id]
 
-                # 只保留設定內的標籤
-                if self.allowed_labels and class_name not in self.allowed_labels:
-                    continue
+                # # 只保留設定內的標籤
+                # if self.allowed_labels and class_name not in self.allowed_labels:
+                #     continue
 
                 # 計算 Bounding Box 正中心點
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
@@ -188,21 +228,51 @@ class YoloDetectionNode(Node):
                 # ------ 計算與影像中心的偏移量 ------
                 delta_x = cx - points[4][0]
 
+                # 根據 class_id 產生隨機但固定的顏色 (B, G, R)
+                rng = np.random.RandomState(class_id)
+                color = tuple(int(c) for c in rng.randint(0, 256, 3))
+
                 # 繪製框和標籤
-                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(det_image, (x1, y1), (x2, y2), color, 2)
                 label = f"{class_name} {conf:.2f} Depth: {depth_text}"
 
                 cv2.putText(
-                    image,
+                    det_image,
                     label,
                     (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
-                    (0, 255, 0),
+                    color,
                     2,
                 )
         self.publish_target_info(found_target, target_distance, delta_x)
-        return image
+        return det_image
+
+    def draw_masks(self, image, results):
+        """在影像上繪製 YOLO 檢測到的 Mask"""
+        height, width = image.shape[:2]
+        mask_image = image.copy()  # 從原始影像複製一份來繪製 Mask
+
+        for result in results:
+            if result.masks is not None:
+                masks = result.masks.data.cpu().numpy()
+                boxes = result.boxes
+                for i, mask in enumerate(masks):
+                    # Create a boolean mask and assign color
+                    mask_resized = cv2.resize(mask, (width, height))
+                    mask_bool = mask_resized > 0.5
+                    
+                    # 根據 class_id 產生隨機但固定的顏色 (B, G, R)
+                    class_id = int(boxes.cls[i])
+                    rng = np.random.RandomState(class_id)
+                    color = tuple(int(c) for c in rng.randint(0, 256, 3))
+                    
+                    # Blend the mask for better visibility
+                    mask_colored = np.zeros_like(mask_image)
+                    mask_colored[mask_bool] = color
+                    mask_image = cv2.addWeighted(mask_image, 1, mask_colored, 0.5, 0)
+
+        return mask_image
 
     def get_depth_at(self, x, y):
         """
@@ -231,13 +301,21 @@ class YoloDetectionNode(Node):
         except IndexError:
             return -1.0
 
-    def publish_image(self, image):
-        """將處理後的影像轉換並發佈到 ROS"""
+    def publish_det_image(self, image):
+        """將 Detection 影像轉換並發佈到 ROS"""
         try:
             compressed_msg = self.bridge.cv2_to_compressed_imgmsg(image)
-            self.image_pub.publish(compressed_msg)
+            self.det_image_pub.publish(compressed_msg)
         except Exception as e:
-            self.get_logger().error(f"Could not publish image: {e}")
+            self.get_logger().error(f"Could not publish detection image: {e}")
+
+    def publish_seg_image(self, image):
+        """將 Segmentation 影像轉換並發佈到 ROS"""
+        try:
+            compressed_msg = self.bridge.cv2_to_compressed_imgmsg(image)
+            self.seg_image_pub.publish(compressed_msg)
+        except Exception as e:
+            self.get_logger().error(f"Could not publish segmentation image: {e}")
 
     def publish_target_info(self, found, distance, delta_x):
         """發佈目標資訊 (找到目標, 距離)"""
