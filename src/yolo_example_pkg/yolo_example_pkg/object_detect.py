@@ -92,6 +92,9 @@ class YoloDetectionNode(Node):
         # auto-task 目標 class：只有此 class 的 box 會被當成候選目標。
         # None 代表不過濾 (回報任意 class)。由 /yolo/target_class 動態切換，切 task 不用重啟。
         self.target_class_name = None
+        # 選取策略：False=near(挑最近、套距離閘門)；True=far(挑最遠、關距離閘門)。
+        # 由 /yolo/target_class 的 "class:far" 後綴切換 (見 target_class_callback)。
+        self.select_far = False
         self.target_class_sub = self.create_subscription(
             String, "/yolo/target_class", self.target_class_callback, 10
         )
@@ -109,11 +112,17 @@ class YoloDetectionNode(Node):
         # 邊緣的熊 bbox 會閃爍、多隻熊時選擇也會逐幀跳動。鎖住「離上一幀選中 cx 最近」
         # 的候選，避免目標身分亂跳。lock_gate_ratio = 容許的橫向位移 (畫面寬比例)。
         self.last_target_cx = None
+        self.last_target_depth = None   # 鎖定目標的深度(far 模式用來拒絕「驟近」的雜熊)
         self.lock_gate_ratio = 0.20     # 上一幀 cx ±20% 寬內視為同一隻
         # 黏鎖：鎖定的熊在接近時會離開視野，此時別跳去追畫面上另一隻(遠處)。
         # gate 內連續找不到原目標的容忍幀數，超過才解除鎖定、全域重挑。
         # 容忍期內回報 found=0，讓 pros_car 的 lost_grace 往原方向回找。
         self.lock_miss_limit = 5
+        # far 模式(Task3 朝門邊遠熊)：遠熊在 3~4m 偵測較易閃，容忍幀數放大，
+        # 多撐幾幀等遠熊框回來，期間回報 found=0 而非跳去近雜熊。
+        self.far_lock_miss_limit = 15
+        # far 模式：候選深度比鎖定目標『近這麼多(公尺)以上』→ 一定是近雜熊頂替，排除不選。
+        self.far_reject_nearer = 0.8
         self._lock_miss = 0
         # 面積下限 (畫面面積比例)：濾掉太小的閃爍弱框。
         self.min_area_ratio = 0.0005    # ~0.05% 影像面積
@@ -147,14 +156,31 @@ class YoloDetectionNode(Node):
         return kept
 
     def target_class_callback(self, msg):
-        """動態設定要追蹤的目標 class (task1=bear, task3=knob...)；空字串代表不過濾。"""
-        name = msg.data.strip()
+        """動態設定要追蹤的目標 class (task1=bear, task3=knob...)；空字串代表不過濾。
+
+        支援選取策略後綴 "class:policy"：
+          - "bear"      → near (預設)：未鎖定挑面積最大(=最近)熊，並套距離閘門剔除遠熊。
+          - "bear:far"  → far：**反過來**挑面積最小(=最遠)熊、且關閉距離閘門。
+            Task3 起步用：起點前方兩隻熊在門邊 (>max_target_distance)，near 模式會被閘門
+            濾光 → 車找不到目標不前進；far 模式才會鎖住遠處門邊熊、driving 車朝門開過去。
+        """
+        raw = msg.data.strip()
+        if ":" in raw:
+            name, policy = raw.split(":", 1)
+            name, policy = name.strip(), policy.strip().lower()
+        else:
+            name, policy = raw, "near"
         self.target_class_name = name if name else None
+        self.select_far = (policy == "far")
         # 重置目標鎖定：避免上一輪 task 殘留的 last_target_cx 讓新一輪「鎖」在舊位置、
         # 用 cx 連續性挑到遠熊而非面積最大的近熊 (每次按 s 啟動 task 都會重發 class)。
         self.last_target_cx = None
+        self.last_target_depth = None
         self._lock_miss = 0
-        self.get_logger().info(f"YOLO target class set to: {self.target_class_name} (lock reset)")
+        self.get_logger().info(
+            f"YOLO target class set to: {self.target_class_name} "
+            f"(select={'far' if self.select_far else 'near'}, lock reset)"
+        )
 
     def depth_callback_raw(self, msg):
         """接收 **無壓縮** 深度圖"""
@@ -310,30 +336,50 @@ class YoloDetectionNode(Node):
         # 去重：同一隻熊常被吐出多個重疊框 (尤其 conf 低時)，會害鎖定在框間跳動。
         # 重疊 (IoU > dedup_iou) 視為同一隻，只留面積最大者。
         candidates = self._dedup_overlapping(candidates)
-        # 距離閘門：剔除「有效深度且 > max_target_distance」的遠熊；保留 depth<=0(未知)的近邊緣熊。
-        candidates = [c for c in candidates
-                      if not (c["depth"] > 0.0 and c["depth"] > self.max_target_distance)]
+        # 距離閘門：near 模式剔除「有效深度且 > max_target_distance」的遠熊 (保留 depth<=0 的近邊緣熊)；
+        # far 模式關閉閘門，否則 Task3 起步要鎖的門邊遠熊會被濾光。
+        if not self.select_far:
+            candidates = [c for c in candidates
+                          if not (c["depth"] > 0.0 and c["depth"] > self.max_target_distance)]
+        miss_limit = self.far_lock_miss_limit if self.select_far else self.lock_miss_limit
         if not candidates:
             self.last_target_cx = None  # 本幀無候選 → 解除鎖定
+            self.last_target_depth = None
             self._lock_miss = 0
         elif self.last_target_cx is None:
-            # 還沒鎖定 → 挑面積最大 (最近) 當目標並鎖定
-            chosen = max(candidates, key=lambda c: c["area"])
+            # 還沒鎖定 → near: 挑面積最大(最近)；far: 反過來挑面積最小(最遠) 當目標並鎖定
+            chosen = (min if self.select_far else max)(candidates, key=lambda c: c["area"])
             self.last_target_cx = chosen["cx"]
+            self.last_target_depth = chosen["depth"] if chosen["depth"] > 0.0 else None
             self._lock_miss = 0
         else:
             # 已鎖定 → 追離上次 cx 最近的候選 (連續性追蹤)
             gate = self.lock_gate_ratio * width
-            nearest = min(candidates, key=lambda c: abs(c["cx"] - self.last_target_cx))
-            if abs(nearest["cx"] - self.last_target_cx) <= gate or self._lock_miss >= self.lock_miss_limit:
-                # gate 內 = 同一隻；或已跟丟夠久 → 接受最靠近上次位置者 (仍非遠熊)
-                chosen = nearest
-                self.last_target_cx = chosen["cx"]
-                self._lock_miss = 0
-            else:
-                # 最近的候選也離上次太遠 → 暫時跟丟，回報 found=0 讓 lost_grace 回找
+            # far 模式：先排除「深度比鎖定目標近很多」的候選 (遠熊閃掉時頂替的近雜熊)。
+            # 這些不是我們鎖的遠熊 → 不讓它被選中，避免 Task3 距離從 3m 暴跳到 1m 的誤判。
+            pool = candidates
+            if (self.select_far and self.last_target_depth is not None
+                    and self.last_target_depth > 0.0):
+                pool = [c for c in candidates
+                        if not (c["depth"] > 0.0
+                                and c["depth"] < self.last_target_depth - self.far_reject_nearer)]
+            if not pool:
+                # 只剩近雜熊 → 視為跟丟一幀，保持鎖定 (回報 found=0，別接受雜熊)
                 self._lock_miss += 1
                 chosen = None
+            else:
+                nearest = min(pool, key=lambda c: abs(c["cx"] - self.last_target_cx))
+                if abs(nearest["cx"] - self.last_target_cx) <= gate or self._lock_miss >= miss_limit:
+                    # gate 內 = 同一隻；或已跟丟夠久 → 接受最靠近上次位置者
+                    chosen = nearest
+                    self.last_target_cx = chosen["cx"]
+                    if chosen["depth"] > 0.0:
+                        self.last_target_depth = chosen["depth"]
+                    self._lock_miss = 0
+                else:
+                    # 最近的候選也離上次太遠 → 暫時跟丟，回報 found=0 讓 lost_grace 回找
+                    self._lock_miss += 1
+                    chosen = None
 
         # ---- 3. 繪製所有候選 (被選中的用粗框 + TARGET 標示) ----
         for c in candidates:
