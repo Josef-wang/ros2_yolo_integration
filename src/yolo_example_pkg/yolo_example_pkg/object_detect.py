@@ -47,6 +47,8 @@ class YoloDetectionNode(Node):
         if using_yolo_seg_model:
             self.seg_model = YOLO(seg_model_path)
             self.seg_model.to(device)
+            # 印出 seg 模型的 class 名 → 依實際『橋面』class 名設 self.bridge_class_name
+            print("Segmentation model classes:", self.seg_model.names)
 
         # 訂閱影像 Topic
         self.image_sub = self.create_subscription(
@@ -75,6 +77,10 @@ class YoloDetectionNode(Node):
         if using_yolo_seg_model:
             self.seg_image_pub = self.create_publisher(
                 CompressedImage, "/yolo/segmentation/compressed", 10
+            )
+            # Task2 上下橋：把橋面 mask 算成數值訊號發出 (橫向置中 + 邊緣/橋頂偵測)
+            self.bridge_info_pub = self.create_publisher(
+                Float32MultiArray, "/yolo/bridge_info", 10
             )
 
         # 發布 目標檢測數據 (是否找到目標 + 距離)
@@ -134,6 +140,16 @@ class YoloDetectionNode(Node):
 
         # 相機畫面中央高度上切成 n 個等距水平點。
         self.x_num_splits = 20
+
+        # ---- Task2 橋面 segmentation 訊號 (/yolo/bridge_info) ----
+        # segmentation.pt 裡『橋面』那個 class 的名字。None = 用全部 seg mask。
+        # 實測 seg_model.names = {0:'bridge', 1:'road'} → 取 'bridge'(road 是地面道路，不能混)。
+        self.bridge_class_name = "bridge"
+        # 橋面 mask 面積佔全畫面比例 ≥ 此值才算 found (濾零星雜訊 mask)。
+        self.bridge_min_area_ratio = 0.02
+        # 取質心的近/遠端橫向 band (影像高度比例)：近端看腳下對齊、遠端看前方對齊。
+        self.bridge_near_band = (0.75, 1.00)   # 底部 25%
+        self.bridge_far_band = (0.45, 0.60)    # 中段
 
     def _dedup_overlapping(self, candidates):
         """同一隻熊常被吐出多個重疊框 → IoU > dedup_iou 視為同一隻，貪婪保留面積最大者。"""
@@ -243,6 +259,10 @@ class YoloDetectionNode(Node):
             
             # 發佈 Segmentation 影像
             self.publish_seg_image(seg_image)
+
+            # Task2：把橋面 mask 算成 /yolo/bridge_info 數值訊號 (橫向置中 + 邊緣/橋頂偵測)
+            h_img, w_img = cv_image.shape[:2]
+            self.publish_bridge_info(seg_results, w_img, h_img)
 
     def draw_cross(self, image):
         # 回傳繪製十字架的影像和畫面正中間的像素座標
@@ -482,6 +502,62 @@ class YoloDetectionNode(Node):
             self.seg_image_pub.publish(compressed_msg)
         except Exception as e:
             self.get_logger().error(f"Could not publish segmentation image: {e}")
+
+    def _bridge_mask(self, results, width, height):
+        """把 segmentation 結果裡屬於『橋面』class 的 mask union 成一張 bool mask
+        (已 resize 到原始畫面大小)。bridge_class_name=None 時用全部 mask。沒有回 None。"""
+        union = None
+        for result in results:
+            if result.masks is None or result.boxes is None:
+                continue
+            masks = result.masks.data.cpu().numpy()
+            clses = result.boxes.cls.cpu().numpy()
+            for i, m in enumerate(masks):
+                if self.bridge_class_name is not None:
+                    if self.seg_model.names[int(clses[i])] != self.bridge_class_name:
+                        continue
+                mb = cv2.resize(m, (width, height)) > 0.5
+                union = mb if union is None else (union | mb)
+        return union
+
+    def publish_bridge_info(self, results, width, height):
+        """Task2 上下橋：從橋面 mask 算訊號發到 /yolo/bridge_info。
+        data = [found, dx, dx_near, dx_far, area_ratio, near_cover, top_ratio]
+          found     : 橋面面積佔比 ≥ bridge_min_area_ratio = 1.0，否則 0.0
+          dx        : 整片 mask 質心 x − 畫面中心 (px)；遠近都有效，ALIGN 對準橋面用
+          dx_near   : 近端 band mask 質心 x − 中心 (px)；過橋途中保持置中用 (底部無 mask 時=0)
+          dx_far    : 遠端 band mask 質心 x − 中心 (px)
+          area_ratio: mask 面積 / 全畫面 (0~1)，越大越貼近/正對橋 (ALIGN 衝刺閘門用)
+          near_cover: 近端 band 屬橋面的像素比例 (0~1)，低=前方沒橋面 (落地判定用)
+          top_ratio : mask 最高 row / height (0=延伸到畫面頂, 1=只在最底)
+        """
+        mask = self._bridge_mask(results, width, height)
+        found = 0.0
+        dx = dx_near = dx_far = 0.0
+        area_ratio = near_cover = 0.0
+        top_ratio = 1.0
+        if mask is not None and mask.any():
+            cx = width / 2.0
+            area_ratio = float(mask.sum()) / float(width * height)
+            found = 1.0 if area_ratio >= self.bridge_min_area_ratio else 0.0
+            dx = float(np.where(mask)[1].mean()) - cx
+            ny0, ny1 = (int(height * self.bridge_near_band[0]),
+                        int(height * self.bridge_near_band[1]))
+            near = mask[ny0:ny1, :]
+            if near.any():
+                dx_near = float(np.where(near)[1].mean()) - cx
+                near_cover = float(near.mean())
+            fy0, fy1 = (int(height * self.bridge_far_band[0]),
+                        int(height * self.bridge_far_band[1]))
+            far = mask[fy0:fy1, :]
+            if far.any():
+                dx_far = float(np.where(far)[1].mean()) - cx
+            rows = np.where(mask.any(axis=1))[0]
+            if len(rows):
+                top_ratio = float(rows.min()) / float(height)
+        msg = Float32MultiArray()
+        msg.data = [found, dx, dx_near, dx_far, area_ratio, near_cover, top_ratio]
+        self.bridge_info_pub.publish(msg)
 
     def publish_target_info(self, found, distance, delta_x):
         """發佈目標資訊 (找到目標, 距離)"""
